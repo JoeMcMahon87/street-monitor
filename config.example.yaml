@@ -1,0 +1,63 @@
+camera:
+  device_id: 0          # integer for webcam index, or a file path for video replay
+  width: 1280
+  height: 720
+  fps: 30               # used if camera doesn't report it; also used for speed calc
+
+calibration:
+  # Pixel coordinates of four road corners, clicked during `calibrate` mode.
+  # Order: top-left, top-right, bottom-right, bottom-left
+  # Run `python -m street_monitor calibrate` to generate these interactively.
+  image_points:
+    - [312, 280]
+    - [968, 280]
+    - [1100, 580]
+    - [180, 580]
+  # Corresponding real-world coordinates in metres (flat road plane, origin = top-left).
+  # Standard single lane width is 3.65 m (US/UK). Measure your baseline length carefully.
+  world_points:
+    - [0.0, 0.0]
+    - [3.65, 0.0]
+    - [3.65, 15.0]
+    - [0.0, 15.0]
+
+detection:
+  model: yolov8n.pt     # n=nano (fastest), s=small, m=medium (most accurate)
+  confidence: 0.4
+  classes: [2, 7]       # COCO class IDs: 2=car, 7=truck
+  device: cpu           # 'cpu' or 'cuda' if a CUDA-capable GPU is available
+
+tracking:
+  max_disappeared: 15       # frames before a track moves to the dormant re-ID pool
+  max_distance: 80          # max pixel centroid distance to associate detection to track
+  max_dormant_frames: 45    # frames to hold a dormant track for re-ID (1.5 s at 30 fps)
+                            # increase if obstructions are wide or vehicles are slow
+  reidentification_distance: 200  # max pixel distance for re-ID match (wider than max_distance)
+
+speed:
+  min_track_frames: 8   # minimum frames before a speed reading is reported
+  smoothing_window: 6   # number of consecutive frame-to-frame speeds to average
+  min_speed_kmh: 3      # below this, treat vehicle as stationary
+  max_speed_kmh: 200    # above this, treat as a spurious detection
+
+lines:
+  # X pixel coordinates of the entry and exit measurement lines (vertical lines).
+  # Set these to bracket the road segment you want to measure along.
+  # entry_x is the left line, exit_x is the right line.
+  entry_x: 200
+  exit_x: 1080
+
+display:
+  show_tracks: true
+  show_bboxes: true
+  show_speed: true
+  show_calibration_grid: false
+  font_scale: 0.7
+  speed_limit_kmh: 50   # vehicles above this are highlighted in red
+
+recording:
+  enabled: true
+  output_dir: data/recordings
+  save_video: false     # save a short annotated video clip per detection
+  save_csv: true        # append each confirmed speed event to a CSV log
+  csv_path: data/recordings/detections.csv
