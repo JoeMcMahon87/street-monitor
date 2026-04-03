@@ -39,6 +39,9 @@ class TrackingConfig:
     max_dormant_frames: int = 45          # frames to hold a lost track for re-ID (1.5 s at 30 fps)
     reidentification_distance: float = 200.0  # max pixel distance for re-ID match
     velocity_scale: float = 2.0           # adaptive threshold = max(max_distance, speed_px * velocity_scale)
+    iou_weight: float = 0.5               # 0 = pure centroid distance; 1 = IoU fully dampens distance cost
+    velocity_smoothing_alpha: float = 0.7 # EMA weight on the most recent velocity sample (0=max smooth, 1=no smooth)
+    max_dormant_pool_size: int = 20       # evict oldest dormant track when pool exceeds this limit
 
 
 @dataclass

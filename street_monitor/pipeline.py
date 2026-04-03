@@ -48,6 +48,11 @@ class Pipeline:
         detections = self._detector.detect(frame)
         tracks = self._tracker.update(detections, frame_number)
 
+        for tid in self._tracker.recently_expired:
+            self._emitted.discard(tid)
+            self._stitched.discard(tid)
+            self._reported_stationary.discard(tid)
+
         completed: list[CompletedDetection] = []
         entry_x = self._config.lines.entry_x
         exit_x = self._config.lines.exit_x

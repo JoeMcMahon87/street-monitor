@@ -9,9 +9,14 @@ from scipy.optimize import linear_sum_assignment
 
 from .config import TrackingConfig
 from .detector import Detection
-from .utils import euclidean_distance
+from .utils import bbox_iou, euclidean_distance
 
 _MAX_HISTORY = 60   # how many centroids / world positions to keep per track
+# Added to the cost matrix when a track's class differs from a detection's class.
+# Large enough to always exceed the adaptive distance threshold, so the Hungarian
+# solver strongly prefers same-class matches without making cross-class impossible
+# when no same-class candidate exists.
+_CLASS_MISMATCH_PENALTY = 10_000.0
 
 
 @dataclass
@@ -42,27 +47,53 @@ class CentroidTracker:
         # Maps track_id -> (track, expiry_frame).
         self._dormant: dict[int, tuple[Track, int]] = {}
         self._next_id = 0
+        # IDs of dormant tracks that expired during the most recent update() call.
+        # Reset at the start of each update(); read by Pipeline to prune its sets.
+        self.recently_expired: list[int] = []
+
+    def _smooth_velocity(self, track: Track) -> tuple[float, float]:
+        """EMA of per-frame velocity vectors, oldest-to-newest, so recent frames dominate."""
+        centroids = list(track.centroids)
+        if len(centroids) < 2:
+            return (0.0, 0.0)
+        alpha = self._config.velocity_smoothing_alpha
+        vx = float(centroids[1][0] - centroids[0][0])
+        vy = float(centroids[1][1] - centroids[0][1])
+        for i in range(2, len(centroids)):
+            vx = alpha * (centroids[i][0] - centroids[i - 1][0]) + (1.0 - alpha) * vx
+            vy = alpha * (centroids[i][1] - centroids[i - 1][1]) + (1.0 - alpha) * vy
+        return (vx, vy)
 
     def _predict_centroid(self, track: Track) -> tuple[float, float]:
-        """Return last centroid + one-step velocity, or last centroid if only one point."""
+        """Return last centroid + EMA-smoothed velocity."""
         centroids = list(track.centroids)
-        if len(centroids) >= 2:
-            dx = centroids[-1][0] - centroids[-2][0]
-            dy = centroids[-1][1] - centroids[-2][1]
-            return (centroids[-1][0] + dx, centroids[-1][1] + dy)
-        return centroids[-1]
+        if len(centroids) < 2:
+            return centroids[-1]
+        vx, vy = self._smooth_velocity(track)
+        return (centroids[-1][0] + vx, centroids[-1][1] + vy)
+
+    def _predict_bbox(self, track: Track) -> tuple[int, int, int, int] | None:
+        """Return a predicted bbox at the predicted centroid using last known dimensions."""
+        if not track.bboxes:
+            return None
+        last = track.bboxes[-1]          # x1, y1, x2, y2
+        w = last[2] - last[0]
+        h = last[3] - last[1]
+        cx, cy = self._predict_centroid(track)
+        hw, hh = w // 2, h // 2
+        return (int(cx - hw), int(cy - hh), int(cx + hw), int(cy + hh))
 
     def _adaptive_max_distance(self, track: Track) -> float:
-        """Scale the distance threshold by the track's current pixel speed."""
+        """Scale the distance threshold by the EMA-smoothed pixel speed."""
         centroids = list(track.centroids)
         if len(centroids) >= 2:
-            dx = centroids[-1][0] - centroids[-2][0]
-            dy = centroids[-1][1] - centroids[-2][1]
-            speed_px = math.sqrt(dx * dx + dy * dy)
+            vx, vy = self._smooth_velocity(track)
+            speed_px = math.sqrt(vx * vx + vy * vy)
             return max(self._config.max_distance, speed_px * self._config.velocity_scale)
         return self._config.max_distance
 
     def update(self, detections: list[Detection], frame_number: int) -> dict[int, Track]:
+        self.recently_expired = []
         # Expire dormant tracks that have been waiting too long.
         expired = [
             tid for tid, (_, exp) in self._dormant.items()
@@ -70,6 +101,7 @@ class CentroidTracker:
         ]
         for tid in expired:
             track, _ = self._dormant.pop(tid)
+            self.recently_expired.append(tid)
             if self._debug:
                 print(f"[DBG f{frame_number}] EXPIRED dormant #{tid} {track.class_name} "
                       f"(min_cx={track.min_cx} max_cx={track.max_cx} "
@@ -87,13 +119,22 @@ class CentroidTracker:
             return dict(self._tracks)
 
         track_ids = list(self._tracks.keys())
+        track_bboxes = [self._predict_bbox(self._tracks[tid]) for tid in track_ids]
         track_centroids = [self._predict_centroid(self._tracks[tid]) for tid in track_ids]
         det_centroids = [d.centroid for d in detections]
 
+        iou_weight = self._config.iou_weight
         cost = np.zeros((len(track_ids), len(detections)), dtype=np.float32)
-        for r, tc in enumerate(track_centroids):
-            for c, dc in enumerate(det_centroids):
-                cost[r, c] = euclidean_distance(tc, dc)
+        for r, (tc, tb) in enumerate(zip(track_centroids, track_bboxes)):
+            track = self._tracks[track_ids[r]]
+            for c, det in enumerate(detections):
+                dist = euclidean_distance(tc, det.centroid)
+                if tb is not None:
+                    iou = bbox_iou(tb, det.bbox)
+                    dist *= (1.0 - iou_weight * iou)
+                if track.class_name != det.class_name:
+                    dist += _CLASS_MISMATCH_PENALTY
+                cost[r, c] = dist
 
         row_ind, col_ind = linear_sum_assignment(cost)
 
@@ -149,6 +190,17 @@ class CentroidTracker:
                       f"→ dormant until f{expiry} "
                       f"(min_cx={track.min_cx} max_cx={track.max_cx} "
                       f"samples={len(track.speed_samples)})")
+
+        # Enforce pool size cap: evict the soonest-expiring (oldest) entries first.
+        while len(self._dormant) > self._config.max_dormant_pool_size:
+            oldest_tid = min(self._dormant, key=lambda tid: self._dormant[tid][1])
+            evicted, _ = self._dormant.pop(oldest_tid)
+            self.recently_expired.append(oldest_tid)
+            if self._debug:
+                print(f"[DBG f{frame_number}] EVICTED (pool cap) #{oldest_tid} "
+                      f"{evicted.class_name} "
+                      f"(min_cx={evicted.min_cx} max_cx={evicted.max_cx} "
+                      f"samples={len(evicted.speed_samples)})")
 
     def _register_or_reidentify(self, det: Detection, frame_number: int) -> None:
         best_tid = None
